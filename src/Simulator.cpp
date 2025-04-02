@@ -774,7 +774,7 @@ void Simulator::excecute() {
   op1 = this->dReg.op1;
   op2 = this->dReg.op2;
   if(is_threeOPerand(inst)) op3 = this->dReg.op3;
-  if(verbose) printf("With operands %d, %d, %d\n", op1, op2, op3); 
+  // if(verbose) printf("With operands %d, %d, %d\n", op1, op2, op3); 
 
   int32_t offset = this->dReg.offset;
   bool predictedBranch = this->dReg.predictedBranch;
@@ -1047,6 +1047,9 @@ void Simulator::excecute() {
       this->dRegNew.bubble = true;
       this->history.unpredictedBranch++;
       this->history.controlHazardCount++;
+      //之前的指令抓错了，也不用管Data Hazard了
+      this->fReg.stall = 0;
+      this->dRegNew.stall = 0;
     }
     // this->dReg.pc: fetch original inst addr, not the modified one
     this->branchPredictor->update(this->dReg.pc, branch);
@@ -1057,6 +1060,9 @@ void Simulator::excecute() {
     this->fRegNew.bubble = true;
     this->dRegNew.bubble = true;
     this->history.controlHazardCount++;
+    this->fReg.stall = 0;
+    this->dRegNew.stall = 0;
+    //同上
   }
 
   // printf("%d\n", (int)isReadMem(inst));
