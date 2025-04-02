@@ -201,7 +201,7 @@ void Simulator::decode() {
   Inst insttype = Inst::UNKNOWN;
   uint32_t inst = this->fReg.inst;
   int32_t op1 = 0, op2 = 0, offset = 0, op3 = 0; // op1, op2 and offset are values
-  RegId dest = 0, reg1 = -1, reg2 = -1, reg3; // reg1 and reg2 are operands
+  RegId dest = 0, reg1 = -1, reg2 = -1, reg3 = -1; // reg1 and reg2 are operands
 
   // Reg for 32bit instructions
   if (this->fReg.len == 4) // 32 bit instruction
@@ -225,6 +225,8 @@ void Simulator::decode() {
                              ((inst >> 1) & 0x7F800) | ((inst >> 12) & 0x80000))
                          << 12 >>
                      11;
+
+
     switch (opcode) {
     case OP_REG:
       op1 = this->reg[rs1];
@@ -715,7 +717,7 @@ void Simulator::decode() {
   this->dRegNew.bubble = false;
   this->dRegNew.rs1 = reg1;
   this->dRegNew.rs2 = reg2;
-  if(is_threeOPerand(insttype)) this->dRegNew.rs3 = reg3;
+  this->dRegNew.rs3 = reg3;
   this->dRegNew.pc = this->fReg.pc;
   this->dRegNew.inst = insttype;
   this->dRegNew.predictedBranch = predictedBranch;
@@ -724,6 +726,22 @@ void Simulator::decode() {
   this->dRegNew.op2 = op2;
   this->dRegNew.op3 = op3;
   this->dRegNew.offset = offset;
+  //Do hazard checks (Dataforwarding disabled)
+  if(disbleForward){
+    int stallCycles = this -> if_stall_cycles_for_newly_decoded_inst();
+    if(stallCycles != 0){
+      //这条被暂停的指令解码得到的数据是错的，要全抛掉
+      //如果放任它取代dReg则会导致系统错判冲突是否解决
+      memset(&this->dRegNew, 0, sizeof(this->dRegNew));
+      this -> dRegNew.stall = stallCycles - 1;
+      this -> dRegNew.bubble = true;
+      this -> fReg.stall = stallCycles;
+      this -> pc -= 4;
+      // 意义不明的时光倒流，先注了看看影响
+      // if(stallCycles == 1) this->history.cycleCount--;
+      this->history.memoryHazardCount++;
+    }
+  }
 }
 
 void Simulator::excecute() {
@@ -987,26 +1005,32 @@ void Simulator::excecute() {
   case FMADD:
     writeReg = true;
     out = int32_t(int32_t((int32_t)op1 * (int32_t)op2) + (int32_t)op3);
+    this -> history.cycleCount += 3;
     break;
   case FMADDU:
   writeReg = true;
   out = op1 * op2 + op3;
+  this -> history.cycleCount += 3;
   break;
   case FMSUB:
   writeReg = true;
   out = int32_t(int32_t((int32_t)op1 * (int32_t)op2) - (int32_t)op3);
+  this -> history.cycleCount += 3;
   break;
   case FMSUBU:
   writeReg = true;
   out = op1 * op2 - op3;
+  this -> history.cycleCount += 3;
   break;
   case FNM:
   writeReg = true;
   out = int32_t(int32_t(-(int32_t)op1 * (int32_t)op2) + (int32_t)op3);
+  this -> history.cycleCount += 3;
   break;
   case FNMU:
   writeReg = true;
   out =  int32_t(int32_t(-(int32_t)op1 * (int32_t)op2) - (int32_t)op3);
+  this -> history.cycleCount += 3;
   break;
   default:
     this->panic("Unknown instruction type %d\n", inst);
@@ -1038,14 +1062,30 @@ void Simulator::excecute() {
   // printf("%d\n", (int)isReadMem(inst));
   if (isReadMem(inst)) {
     // printf("Is read mem\n");
-    if (this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this -> dRegNew.rs3 == destReg && is_threeOPerand(this -> dRegNew.inst))) {
-      // if(!)
-      this->fRegNew.stall = 2;
-      this->dRegNew.stall = 2;
-      this->eRegNew.bubble = true;
-      this->history.cycleCount--;
-      this->history.memoryHazardCount++;
+    if(!disbleForward){
+      if (this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this -> dRegNew.rs3 == destReg && is_threeOPerand(this -> dRegNew.inst))) {
+        // if(verbose) 
+        //   printf("hazard with lw, retreating\n");
+        this->fRegNew.stall = 2;
+        this->dRegNew.stall = 2;
+        //我怀疑这句话完全没用，因为下面给覆盖掉了
+        //逆天He Hao
+        // this->eRegNew.bubble = true;
+        this->history.cycleCount--;
+        this->history.memoryHazardCount++;
+      }
     }
+    // else{
+    //   if (this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this -> dRegNew.rs3 == destReg && is_threeOPerand(this -> dRegNew.inst))) {
+    //     this->fReg.stall = 3;
+    //     this->dRegNew.stall = 2;
+    //     this->dRegNew.bubble = true;
+    //     this->eRegNew.bubble = true;
+    //     this->history.cycleCount--;
+    //     this->history.memoryHazardCount++;
+    //     this->pc -= 4;
+    //   }
+    // }
   }
 
   // Check for data hazard and forward data
@@ -1076,16 +1116,18 @@ void Simulator::excecute() {
           printf("  Forward Data %s to Decode op3\n", REGNAME[destReg]);
       }
     }
-    else{
-      //Data Forwarding disabled, wait until the WB stage
-      if(this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this->dRegNew.rs3 == destReg && is_threeOPerand(this -> dRegNew.inst))){
-        this->fRegNew.stall = 2;
-        this->dRegNew.stall = 2;
-        this->eRegNew.bubble = true;
-        this->history.cycleCount--;
-        this->history.memoryHazardCount++;
-      }
-    }
+    // else{
+    //   //Data Forwarding disabled, wait until the WB stage
+    //   if(this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this->dRegNew.rs3 == destReg && is_threeOPerand(this -> dRegNew.inst))){
+    //     this->fReg.stall = 3;
+    //     this->dRegNew.stall = 2;
+    //     this->dRegNew.bubble = true;
+    //     this->eRegNew.bubble = true;
+    //     this->history.cycleCount--;
+    //     this->history.memoryHazardCount++;
+    //     this->pc -= 4;
+    //   }
+    // }
   }
 
   this->eRegNew.bubble = false;
@@ -1200,54 +1242,74 @@ void Simulator::memoryAccess() {
   }
 
   // Check for data hazard and forward data
-  if (writeReg && destReg != 0 && !disbleForward) {
-    if (this->dRegNew.rs1 == destReg) {
-      // Avoid overwriting recent values
-      if (this->executeWriteBack == false ||
-          (this->executeWriteBack && this->executeWBReg != destReg)) {
-        this->dRegNew.op1 = out;
+  if (writeReg && destReg != 0) {
+    if(!disbleForward){
+      if (this->dRegNew.rs1 == destReg) {
+        // Avoid overwriting recent values
+        if (this->executeWriteBack == false ||
+            (this->executeWriteBack && this->executeWBReg != destReg)) {
+          this->dRegNew.op1 = out;
+          this->memoryWriteBack = true;
+          this->memoryWBReg = destReg;
+          this->history.dataHazardCount++;
+          if (verbose)
+            printf("  Forward Data %s to Decode op1\n", REGNAME[destReg]);
+        }
+      }
+      if (this->dRegNew.rs2 == destReg) {
+        // Avoid overwriting recent values
+        if (this->executeWriteBack == false ||
+            (this->executeWriteBack && this->executeWBReg != destReg)) {
+          this->dRegNew.op2 = out;
+          this->memoryWriteBack = true;
+          this->memoryWBReg = destReg;
+          this->history.dataHazardCount++;
+          if (verbose)
+            printf("  Forward Data %s to Decode op2\n", REGNAME[destReg]);
+        }
+      }
+      if (is_threeOPerand(this -> dRegNew.inst) && this->dRegNew.rs3 == destReg) {
+        // Avoid overwriting recent values
+        if (this->executeWriteBack == false ||
+            (this->executeWriteBack && this->executeWBReg != destReg)) {
+          this->dRegNew.op3 = out;
+          this->memoryWriteBack = true;
+          this->memoryWBReg = destReg;
+          this->history.dataHazardCount++;
+          if (verbose)
+            printf("  Forward Data %s to Decode op3\n", REGNAME[destReg]);
+          }
+        }
+    
+      // Corner case of forwarding mem load data to stalled decode reg
+      if (this->dReg.stall) {
+        if (this->dReg.rs1 == destReg) this->dReg.op1 = out;
+        if (this->dReg.rs2 == destReg) this->dReg.op2 = out;
+        if (is_threeOPerand(this -> dReg.inst) && this->dReg.rs3 == destReg) this->dReg.op3 = out;
         this->memoryWriteBack = true;
         this->memoryWBReg = destReg;
         this->history.dataHazardCount++;
         if (verbose)
-          printf("  Forward Data %s to Decode op1\n", REGNAME[destReg]);
+            printf("  Forward Data %s to Decode op2\n", REGNAME[destReg]);
       }
     }
-    if (this->dRegNew.rs2 == destReg) {
-      // Avoid overwriting recent values
-      if (this->executeWriteBack == false ||
-          (this->executeWriteBack && this->executeWBReg != destReg)) {
-        this->dRegNew.op2 = out;
-        this->memoryWriteBack = true;
-        this->memoryWBReg = destReg;
-        this->history.dataHazardCount++;
-        if (verbose)
-          printf("  Forward Data %s to Decode op2\n", REGNAME[destReg]);
-      }
-    }
-    if (is_threeOPerand(this -> dRegNew.inst) && this->dRegNew.rs3 == destReg) {
-      // Avoid overwriting recent values
-      if (this->executeWriteBack == false ||
-          (this->executeWriteBack && this->executeWBReg != destReg)) {
-        this->dRegNew.op3 = out;
-        this->memoryWriteBack = true;
-        this->memoryWBReg = destReg;
-        this->history.dataHazardCount++;
-        if (verbose)
-          printf("  Forward Data %s to Decode op3\n", REGNAME[destReg]);
-      }
-    }
-    // Corner case of forwarding mem load data to stalled decode reg
-    if (this->dReg.stall) {
-      if (this->dReg.rs1 == destReg) this->dReg.op1 = out;
-      if (this->dReg.rs2 == destReg) this->dReg.op2 = out;
-      if (is_threeOPerand(this -> dReg.inst) && this->dReg.rs3 == destReg) this->dReg.op3 = out;
-      this->memoryWriteBack = true;
-      this->memoryWBReg = destReg;
-      this->history.dataHazardCount++;
-      if (verbose)
-          printf("  Forward Data %s to Decode op2\n", REGNAME[destReg]);
-    }
+    // else{
+    //   if(this->dRegNew.rs1 == destReg || this->dRegNew.rs2 == destReg || (this->dRegNew.rs3 == destReg && is_threeOPerand(this->dRegNew.inst))){
+    //     //Data Hazard Encountered
+    //     //不用管dReg, 因为如果有冲突那么上一步就已经处理过了
+    //     //需要防备dRegNew已经被设置过stall了（即指令3需要指令2和1， 1的MEM会和2的EXE部分同时给dRegNew设置不同的stall值）
+    //     //和EXE中的类似，除了stall的周期数都被减了1
+    //     if(!this->dRegNew.stall){
+    //       this->fReg.stall = 2;
+    //       this->dRegNew.stall = 1;
+    //       this->dRegNew.bubble = true;
+    //       this->eRegNew.bubble = true;
+    //       this->history.cycleCount--;
+    //       this->history.memoryHazardCount++;
+    //       this->pc -= 4;
+    //     }
+    //   }
+    // }
   }
 
   this->mRegNew.bubble = false;
@@ -1280,55 +1342,73 @@ void Simulator::writeBack() {
   }
 
   if (this->mReg.writeReg && this->mReg.destReg != 0) {
+    if(!disbleForward){
     // Check for data hazard and forward data
-    if (this->dRegNew.rs1 == this->mReg.destReg) {
-      // Avoid overwriting recent data
-      if (!this->executeWriteBack ||
-          (this->executeWriteBack &&
-           this->executeWBReg != this->mReg.destReg)) {
-        if (!this->memoryWriteBack ||
-            (this->memoryWriteBack &&
-             this->memoryWBReg != this->mReg.destReg)) {
-          this->dRegNew.op1 = this->mReg.out;
-          this->history.dataHazardCount++;
-          if (verbose)
-            printf("  Forward Data %s to Decode op1\n",
-                   REGNAME[this->mReg.destReg]);
+      if (this->dRegNew.rs1 == this->mReg.destReg) {
+        // Avoid overwriting recent data
+        if (!this->executeWriteBack ||
+            (this->executeWriteBack &&
+            this->executeWBReg != this->mReg.destReg)) {
+          if (!this->memoryWriteBack ||
+              (this->memoryWriteBack &&
+              this->memoryWBReg != this->mReg.destReg)) {
+            this->dRegNew.op1 = this->mReg.out;
+            this->history.dataHazardCount++;
+            if (verbose)
+              printf("  Forward Data %s to Decode op1\n",
+                    REGNAME[this->mReg.destReg]);
+          }
+        }
+      }
+      if (this->dRegNew.rs2 == this->mReg.destReg) {
+        // Avoid overwriting recent data
+        if (!this->executeWriteBack ||
+            (this->executeWriteBack &&
+            this->executeWBReg != this->mReg.destReg)) {
+          if (!this->memoryWriteBack ||
+              (this->memoryWriteBack &&
+              this->memoryWBReg != this->mReg.destReg)) {
+            this->dRegNew.op2 = this->mReg.out;
+            this->history.dataHazardCount++;
+            if (verbose)
+              printf("  Forward Data %s to Decode op2\n",
+                    REGNAME[this->mReg.destReg]);
+          }
+        }
+      }
+      if (is_threeOPerand(this -> dRegNew.inst) && this->dRegNew.rs3 == this->mReg.destReg) {
+        // Avoid overwriting recent data
+        if (!this->executeWriteBack ||
+            (this->executeWriteBack &&
+            this->executeWBReg != this->mReg.destReg)) {
+          if (!this->memoryWriteBack ||
+              (this->memoryWriteBack &&
+              this->memoryWBReg != this->mReg.destReg)) {
+            this->dRegNew.op3 = this->mReg.out;
+            this->history.dataHazardCount++;
+            if (verbose)
+              printf("  Forward Data %s to Decode op3\n",
+                    REGNAME[this->mReg.destReg]);
+          }
         }
       }
     }
-    if (this->dRegNew.rs2 == this->mReg.destReg) {
-      // Avoid overwriting recent data
-      if (!this->executeWriteBack ||
-          (this->executeWriteBack &&
-           this->executeWBReg != this->mReg.destReg)) {
-        if (!this->memoryWriteBack ||
-            (this->memoryWriteBack &&
-             this->memoryWBReg != this->mReg.destReg)) {
-          this->dRegNew.op2 = this->mReg.out;
-          this->history.dataHazardCount++;
-          if (verbose)
-            printf("  Forward Data %s to Decode op2\n",
-                   REGNAME[this->mReg.destReg]);
-        }
-      }
-    }
-    if (is_threeOPerand(this -> dRegNew.inst) && this->dRegNew.rs3 == this->mReg.destReg) {
-      // Avoid overwriting recent data
-      if (!this->executeWriteBack ||
-          (this->executeWriteBack &&
-           this->executeWBReg != this->mReg.destReg)) {
-        if (!this->memoryWriteBack ||
-            (this->memoryWriteBack &&
-             this->memoryWBReg != this->mReg.destReg)) {
-          this->dRegNew.op3 = this->mReg.out;
-          this->history.dataHazardCount++;
-          if (verbose)
-            printf("  Forward Data %s to Decode op3\n",
-                   REGNAME[this->mReg.destReg]);
-        }
-      }
-    }
+    // else{
+    //   //在本阶段写入的时候，decode已经完成，这意味着数据拿的是错的，需要抛弃原本的解码
+    //   //然而同样需要注意前面可能已经修改过stall, 同时fReg拿到的指令需要保留，偏移的PC需要被减少
+    //   if(this->dRegNew.rs1 == mReg.destReg || this->dRegNew.rs2 == mReg.destReg || (this->dRegNew.rs3 == mReg.destReg && is_threeOPerand(this->dRegNew.inst))){
+    //     if(!dRegNew.stall){
+    //       //这里用stall是因为如果之前被设置过了，stall肯定大于1
+    //       this->fReg.stall = 1;
+    //       this->dRegNew.stall = 0;
+    //       this->dRegNew.bubble = true;
+    //       this->eRegNew.bubble = true;
+    //       this->history.cycleCount--;
+    //       this->history.memoryHazardCount++;
+    //       this->pc -= 4;
+    //     }
+    //   }
+    // }
 
     // Real Write Back
     this->reg[this->mReg.destReg] = this->mReg.out;
@@ -1459,4 +1539,29 @@ void Simulator::panic(const char *format, ...) {
   this->dumpHistory();
   fprintf(stderr, "Execution history and memory dump in dump.txt\n");
   exit(-1);
+}
+
+void Simulator::freezeIDIF(int cycles){
+    this -> fReg.stall = cycles + 1;
+    this -> dReg.stall = cycles;
+    if(verbose){
+      printf("Reduce biased pc from %d to %d\n", this -> pc, this -> pc - 4);
+    }
+    this -> pc = this -> pc - 4;
+}
+
+int Simulator::if_stall_cycles_for_newly_decoded_inst(){
+  bool EXEWrite = dReg.dest != 0;
+  bool EXEHazard = this -> dReg.dest == this -> dRegNew.rs1 || this -> dReg.dest == this -> dRegNew.rs2 || this -> dReg.dest == this -> dRegNew.rs3;
+  if(EXEHazard && EXEWrite) return 3;
+
+  bool MEMWrite = this -> eReg.writeReg && this -> eReg.destReg != 0;
+  bool MEMHazard = this-> eReg.destReg == this -> dRegNew.rs1 || this -> eReg.destReg == this -> dRegNew.rs2 || this ->eReg.destReg == this -> dRegNew.rs3;
+  if(MEMWrite && MEMHazard) return 2;
+
+  bool WBWrite = this -> mReg.writeReg && this -> mReg.destReg != 0;
+  bool WBHazard = this-> mReg.destReg == this -> dRegNew.rs1 || this -> mReg.destReg == this -> dRegNew.rs2 || this ->mReg.destReg == this -> dRegNew.rs3;
+
+  if(WBWrite && WBHazard) return 1;
+  return 0;
 }
